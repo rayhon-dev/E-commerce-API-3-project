@@ -1,28 +1,85 @@
+from apps.core.exceptions import (
+    CodeError,
+    CodeExpiredOrInvalid,
+    PhoneNumberAlreadyExists,
+    PhoneNumberNotFound,
+    PhoneNumberNotVerified,
+)
+from apps.core.validators import validate_phone
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from rest_framework import serializers
-from apps.users.models import UserProfile
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+User = get_user_model()
 
 
-class UserProfileSerializer(serializers.ModelSerializer):
-    email = serializers.EmailField(source='user.email')
-    date_joined = serializers.DateTimeField(source='user.date_joined', read_only=True)
+class AuthorizeSerializer(serializers.Serializer):
+    phone = serializers.CharField(validators=[validate_phone], min_length=12)
+    password = serializers.CharField(write_only=True, min_length=8)
 
-    class Meta:
-        model = UserProfile
-        fields = [
-            'id',
-            'phone',
-            'name',
-            'email',
-            'default_shipping_address',
-            'date_joined',
-        ]
+    def validate(self, attrs):
+        phone = attrs["phone"]
+        if User.objects.filter(phone=phone).exists():
+            raise PhoneNumberAlreadyExists
+        return attrs
 
-    def update(self, instance, validated_data):
-        user_data = validated_data.pop('user', {})
-        user = instance.user
 
-        if 'email' in user_data:
-            user.email = user_data['email']
-            user.save()
+class VerifySerializer(serializers.Serializer):
+    phone = serializers.CharField(validators=[validate_phone])
+    code = serializers.IntegerField()
 
-        return super().update(instance, validated_data)
+    def validate_code(self, code):
+        if code not in range(100000, 1000000):
+            raise CodeError
+        return code
+
+    def validate(self, attrs):
+        phone = attrs["phone"]
+        code = attrs.pop("code")
+        cache_data = cache.get(key=phone)
+        if cache_data is None:
+            raise CodeExpiredOrInvalid
+        code_, value = cache_data
+        if code_ != code:
+            raise CodeExpiredOrInvalid
+        match code_, value:
+            case code_, None:
+                cache.delete(key=phone)
+                User.add_to_cache(key=phone, value=True, ttl=120)
+            case code_, str():
+                cache.delete(key=phone)
+                attrs["password"] = value
+            case _:
+                raise CodeExpiredOrInvalid
+        return attrs
+
+
+class LoginSerializer(TokenObtainPairSerializer):
+    pass
+
+
+class LogoutSerializer(serializers.Serializer):
+    refresh = serializers.CharField()
+
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    phone = serializers.CharField(validators=[validate_phone])
+
+    def validate_phone(self, phone):
+        if not User.objects.filter(phone=phone).exists():
+            raise PhoneNumberNotFound
+        return phone
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    phone = serializers.CharField(validators=[validate_phone])
+    password = serializers.CharField(write_only=True, min_length=8)
+
+    def validate(self, attrs):
+        phone = attrs.get("phone")
+        value = cache.get(key=phone)
+        cache.delete(key=phone)
+        if value is None:
+            raise PhoneNumberNotVerified
+        return attrs
